@@ -150,7 +150,7 @@ def generateVerosSetup(
     cold_start_ocean_temperature_reference_K: float = 15.0,
 ):
 
-
+    print(f"landsea_mask_threshold = {landsea_mask_threshold:f}")
     grid_info = GridInfo(
         scrip_grid_file = scrip_grid_file,
         landsea_mask_file = landsea_mask_file,
@@ -180,7 +180,7 @@ def generateVerosSetup(
             settings.description = "My Veros setup"
 
             settings.enable_streamfunction = False  # then it solve linear free surface
-            settings.enable_nan_checks = True
+            settings.enable_nan_checks = False
 
             settings.nx, settings.ny, settings.nz = grid_info.nx, grid_info.ny, nz
             settings.dt_mom = dt_mom
