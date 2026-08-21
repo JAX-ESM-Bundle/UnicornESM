@@ -147,6 +147,7 @@ def build_model(
     debug_mode=False,
     freeze_season_at_day=None,
     grid_folder: str,
+    landsea_mask_threshold:float = 0.01
 ):
     """Build the coupled JCM + Veros + SlabOceanModel system.
 
@@ -160,7 +161,7 @@ def build_model(
     itself. The diurnal cycle keeps advancing normally. See `_freeze_season`.
     """
 
-    landsea_mask_threshold = 0.5
+
     grid_folder = Path(grid_folder)
     data_files = {
         "grid" : {
