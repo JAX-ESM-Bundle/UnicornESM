@@ -1,5 +1,6 @@
 # Couple JCM and Veros using JAX-ESM (JEM).
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,6 +40,8 @@ parser.add_argument("--max-rerun-attempts", type=int, help="If model exploded, t
 parser.add_argument("--explode-log", type=str, help="Path to log file for recording model explosion events.", default="explode.log")
 parser.add_argument("--debug-mode", action="store_true", help="Turn on debug mode. Detect NaN and enter breakpoint.")
 parser.add_argument("--grid-folder", type=str, help="Grid folder containing grid, land-sea mask, and regrid weightings.", required=True)
+parser.add_argument("--coupling-timestep-hours", type=float, help="Interval between atm<->ocn coupling exchanges, in hours.", default=24.0)
+parser.add_argument("--checkpoint-interval", type=int, help="The interval(batch) of checkpoint saving.", default=1)
 args = parser.parse_args()
 
 print(f"jcm library is located at: {jcm.__file__}")
@@ -56,7 +59,7 @@ truncation_number = args.truncation_number
 total_simulation_time = jdt.to_timedelta(args.total_simulation_days, "day")
 simulation_interval = jdt.to_timedelta(args.simulation_interval_days, "day")
 start_datetime = jdt.to_datetime("2000-01-01")
-coupling_timestep = jdt.to_timedelta(1, "day")
+coupling_timestep = jdt.to_timedelta(int(args.coupling_timestep_hours * 3600), "second")
 
 output_dir = (Path(f"output_T{truncation_number}") / args.simulation_name).resolve()
 output_dir.mkdir(exist_ok=True, parents=True)
@@ -160,10 +163,21 @@ for b in range(resume_batch, batches):
         ds.close()
   
     initial_carry = final_carry
-    save_coupled_carry(
-        final_carry, checkpoint_dir / f"batch_{b:05d}",
-        component_savers={"ocn": save_veros_carry},
-    )
+
+    if (b+1) % args.checkpoint_interval == 0:
+        print(f"Save checkpoint: batch {b:d}")
+        new_checkpoint_dir = checkpoint_dir / f"batch_{b:05d}"
+        save_coupled_carry(
+            final_carry, new_checkpoint_dir,
+            component_savers={"ocn": save_veros_carry},
+        )
+        # Resuming only ever reads the latest checkpoint (`saved[-1]`
+        # above), so older ones are dead weight -- prune them right after
+        # the new one is safely written, rather than letting every
+        # batch's checkpoint accumulate for the whole run.
+        for old_dir in checkpoint_dir.glob("batch_*"):
+            if old_dir != new_checkpoint_dir:
+                shutil.rmtree(old_dir)
 
 print(f"Program ends.")
 
