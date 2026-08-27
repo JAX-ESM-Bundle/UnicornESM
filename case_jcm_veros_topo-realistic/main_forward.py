@@ -42,6 +42,7 @@ parser.add_argument("--debug-mode", action="store_true", help="Turn on debug mod
 parser.add_argument("--grid-folder", type=str, help="Grid folder containing grid, land-sea mask, and regrid weightings.", required=True)
 parser.add_argument("--coupling-timestep-hours", type=float, help="Interval between atm<->ocn coupling exchanges, in hours.", default=24.0)
 parser.add_argument("--checkpoint-interval", type=int, help="The interval(batch) of checkpoint saving.", default=1)
+parser.add_argument("--ocean-surface-thickness", type=float, help="Thickness (m) of the ocean's top vertical layer, in the geometric-stretched ddz grid built by model_setup._geometric_stretched_ddz.", default=30.0)
 args = parser.parse_args()
 
 print(f"jcm library is located at: {jcm.__file__}")
@@ -78,6 +79,7 @@ model, config = build_model(
     veros_dt_mom=args.veros_timestep_min * 60,
     veros_dt_tracer=args.veros_timestep_min * 60,
     grid_folder = args.grid_folder,
+    ocean_surface_thickness = args.ocean_surface_thickness,
 )
 ocn_model = model.components["ocn"].raw_component
 
