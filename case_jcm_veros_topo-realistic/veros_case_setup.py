@@ -295,7 +295,21 @@ def generateVerosSetup(
             temp_anomaly = 5.0 * npx.exp(-distace_square) * vs.maskT * 0
 
             vs.temp = update(vs.temp, at[...], ((1 - vs.zt[None, None, :] / vs.zw[0]) * cold_start_ocean_temperature_reference_K * vs.maskT + temp_anomaly)[..., None] )
-            vs.salt = update(vs.salt, at[...], 35.0 * vs.maskT[..., None])
+
+            # A/B test (2026-08-21): weak halocline (salinity was uniform
+            # 35 psu, contributing zero to N^2/L_rossby) -- saltier/denser
+            # at depth, fresher/lighter at the surface, deltaS_psu total
+            # range top-to-bottom, using the same depth factor as the temp
+            # profile above (1 at surface, 0 at bottom). Testing whether
+            # this measurably helps L_rossby/dx at the marginal interior
+            # row found on the 0.5deg/86.5deg grid.
+            deltaS_psu = 0.0
+            depth_factor = 1 - vs.zt[None, None, :] / vs.zw[0]
+            vs.salt = update(
+                vs.salt,
+                at[...],
+                ((35.0 + deltaS_psu / 2 - deltaS_psu * depth_factor) * vs.maskT)[..., None],
+            )
 
             # wind stress forcing
             yt_min = global_min(vs.yt.min())
@@ -363,6 +377,7 @@ def generateVerosSetup(
             """
         @veros_routine
         def after_timestep(self, state):
-            pass
+            vs = state.variables
+            settings = state.settings
 
     return VerosCaseSetup
