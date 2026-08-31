@@ -415,7 +415,11 @@ def build_model(
         # needed -- masking either to zero here, rather than letting
         # JCM's own fmask blend handle the coastline, would inject a
         # literal 0 Kelvin discontinuity at every coastal cell).
-        atm["forcing"].sea_surface_temperature = dm.transform_scalar("exchange", "atm", "bilinear", ocn["derived"].sea_surface_temperature)
+        atm["forcing"].sea_surface_temperature = jnp.clip(
+            dm.transform_scalar("exchange", "atm", "bilinear", ocn["derived"].sea_surface_temperature),
+            250.0,
+            310.0, 
+        )
         atm["forcing"].stl_am = dm.transform_scalar("exchange", "atm", "bilinear", fakelnd["state"].sea_surface_temperature)
 
 
