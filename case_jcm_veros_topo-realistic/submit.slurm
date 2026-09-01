@@ -36,8 +36,9 @@ JOB_ID=${SLURM_JOBID:-NO_JOB_ID}
 grid_folder=grid_res-3deg
 
 time python3 main_forward.py \
-    --total-simulation-days $(( 365 * 100 ))        \
+    --total-simulation-days $(( 365 * 1000 ))       \
     --simulation-interval-days 73                   \
+    --checkpoint-interval $(( 5 * 5 ))              \
     --truncation-number 31                          \
     --simulation-name real_topo                     \
     --jcm-timestep-min 30                           \

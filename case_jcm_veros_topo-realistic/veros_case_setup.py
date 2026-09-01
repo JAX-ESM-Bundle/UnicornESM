@@ -147,7 +147,7 @@ def generateVerosSetup(
     ddz: Sequence[float] = [50.0, 70.0, 100.0, 140.0, 190.0, 240.0, 290.0, 340.0, 390.0, 440.0, 490.0, 540.0, 590.0, 640.0, 690.0],
     dt_mom: float = 1800.0,
     dt_tracer: float = 1800.0,
-    cold_start_ocean_temperature_reference_K: float = 15.0,
+    cold_start_ocean_temperature_reference_K: float = 10.0,
 ):
 
     print(f"landsea_mask_threshold = {landsea_mask_threshold:f}")
@@ -237,6 +237,15 @@ def generateVerosSetup(
             settings.enable_idemix = False
 
             settings.eq_of_state_type = 1
+
+            # Allocates `temp_source`/`salt_source` and makes
+            # `thermodynamics` apply them (veros/core/diffusion.py
+            # `tempsalt_sources`). Needed for the penetrating-shortwave
+            # heating profile, which `model_setup.build_model`'s `interaction`
+            # mapper writes straight into `temp_source` each coupling step --
+            # see `_shortwave_penetration_divergence` there. `salt_source`
+            # stays at its allocated zeros.
+            settings.enable_tempsalt_sources = True
 
             var_meta = state.var_meta
             var_meta.update(

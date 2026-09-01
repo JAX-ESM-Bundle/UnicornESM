@@ -36,13 +36,14 @@ parser.add_argument("--truncation-number", type=int, help="Truncation number", d
 parser.add_argument("--jcm-timestep-min", type=int, help="JCM timestep in minutes", default=30)
 parser.add_argument("--veros-timestep-min", type=int, help="Veros timestep in minutes", default=30)
 parser.add_argument("--do-not-average-time", action="store_true", help="Do not average time dimension for each interval.")
-parser.add_argument("--max-rerun-attempts", type=int, help="If model exploded, then the model would rerun because stochasticitiy might bypass the instability next time. This value is by default 0, but if you set any positive integer number, model will rerun N times before it gave up.", default=0)
+parser.add_argument("--max-rerun-attempts", type=int, help="If model exploded, then the model would rerun because stochasticitiy might bypass the instability next time. This value is by default 0, but if you set any positive integer number, model will rerun N times before it gave up.", default=5)
 parser.add_argument("--explode-log", type=str, help="Path to log file for recording model explosion events.", default="explode.log")
 parser.add_argument("--debug-mode", action="store_true", help="Turn on debug mode. Detect NaN and enter breakpoint.")
 parser.add_argument("--grid-folder", type=str, help="Grid folder containing grid, land-sea mask, and regrid weightings.", required=True)
 parser.add_argument("--coupling-timestep-hours", type=float, help="Interval between atm<->ocn coupling exchanges, in hours.", default=24.0)
 parser.add_argument("--checkpoint-interval", type=int, help="The interval(batch) of checkpoint saving.", default=1)
 parser.add_argument("--ocean-surface-thickness", type=float, help="Thickness (m) of the ocean's top vertical layer, in the geometric-stretched ddz grid built by model_setup._geometric_stretched_ddz.", default=30.0)
+parser.add_argument("--no-shortwave-penetration", action="store_true", help="Absorb the whole solar flux in the ocean's top layer instead of spreading it over depth with the two-band exponential profile of model_setup._shortwave_penetration_divergence. Mainly a control knob for stability experiments.")
 args = parser.parse_args()
 
 print(f"jcm library is located at: {jcm.__file__}")
@@ -80,6 +81,7 @@ model, config = build_model(
     veros_dt_tracer=args.veros_timestep_min * 60,
     grid_folder = args.grid_folder,
     ocean_surface_thickness = args.ocean_surface_thickness,
+    enable_shortwave_penetration = not args.no_shortwave_penetration,
 )
 ocn_model = model.components["ocn"].raw_component
 

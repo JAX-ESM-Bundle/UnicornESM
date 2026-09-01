@@ -138,6 +138,57 @@ def _geometric_stretched_ddz(n_layers: int, surface_thickness: float, total_dept
     return [surface_thickness * ratio ** k for k in range(n_layers)]
 
 
+def _shortwave_penetration_divergence(
+    zw,
+    dzt,
+    rpart_shortwave: float = 0.58,
+    efold1_shortwave: float = 0.35,
+    efold2_shortwave: float = 23.0,
+):
+    """Vertical divergence of the solar penetration profile, `divpen` (1/m).
+
+    Ported verbatim from `veros/setups/global_1deg/global_1deg.py`
+    (`set_initial_conditions`). Solar radiation is not absorbed entirely in
+    the ocean's top layer: it decays with depth as a two-band exponential
+    (Paulson & Simpson 1977 / the SPEEDY-era "Jerlov water type I" fit),
+
+        pen(z) = rpart * exp(z / efold1) + (1 - rpart) * exp(z / efold2)
+
+    with `z <= 0` (Veros' `zw` is the *upper* interface of each T-cell, so
+    `zw[-1] == 0` is the surface and `zw[0]` the ocean floor). `rpart` is
+    the red/near-IR fraction, killed off within `efold1` (0.35 m) of the
+    surface; the remainder is the blue-green band, reaching `efold2` (23 m).
+
+    `pen` is deliberately set to 0 -- not 1 -- at the surface. The full
+    shortwave flux is *already* being applied to the top layer as part of
+    the net surface heat flux (`forc_temp_surface`), so what this profile
+    contributes is a pure *redistribution*: `sum(divpen * dzt) == 0` by
+    construction (telescoping sum, ending at `pen[-1] == 0`), taking the
+    penetrating fraction back out of the top layer and depositing it in the
+    layers below. That means callers do not have to (and must not) also
+    subtract the shortwave part out of the surface heat flux themselves.
+
+    Below the sea floor the deposited heat is dropped rather than
+    redistributed, since `tempsalt_sources` multiplies `temp_source` by
+    `maskT` -- the same behaviour as global_1deg. Harmless for this setup's
+    flat-bottom (5200 m) ocean, where `pen` is ~1e-10 at the deepest
+    interface anyway.
+    """
+    zw = jnp.asarray(zw)
+    dzt = jnp.asarray(dzt)
+
+    pen = (
+        rpart_shortwave * jnp.exp(zw / efold1_shortwave)
+        + (1.0 - rpart_shortwave) * jnp.exp(zw / efold2_shortwave)
+    )
+    pen = pen.at[-1].set(0.0)
+
+    divpen = jnp.empty_like(pen)
+    divpen = divpen.at[1:].set((pen[1:] - pen[:-1]) / dzt[1:])
+    divpen = divpen.at[0].set(pen[0] / dzt[0])
+    return divpen
+
+
 def _build_jcm_terrain_file(atm_grid, land_fraction, topography, output_file):
     """Build a JCM-canonical terrain file (dims (lon, lat), vars lsm/orog --
     see jcm.terrain.TerrainData.from_file) directly from `dm`'s in-memory
@@ -187,7 +238,11 @@ def build_model(
     freeze_season_at_day=None,
     grid_folder: str,
     landsea_mask_threshold:float = 0.01,
-    ocean_surface_thickness: float = 30.0,
+    ocean_surface_thickness: float = 10.0,
+    enable_shortwave_penetration: bool = True,
+    shortwave_rpart: float = 0.58,
+    shortwave_efold1: float = 0.35,
+    shortwave_efold2: float = 23.0,
 ):
     """Build the coupled JCM + Veros + SlabOceanModel system.
 
@@ -199,6 +254,19 @@ def build_model(
     `start_datetime` at which to freeze the atmosphere's seasonal (solar and
     climatological-forcing) cycle -- e.g. `0` pins it at `start_datetime`
     itself. The diurnal cycle keeps advancing normally. See `_freeze_season`.
+
+    `enable_shortwave_penetration`: let the absorbed solar flux be deposited
+    over a finite depth range instead of entirely in the ocean's top layer,
+    using the two-band exponential profile of
+    `_shortwave_penetration_divergence` (`shortwave_rpart` /
+    `shortwave_efold1` / `shortwave_efold2` are its parameters). Without it,
+    100% of the daytime insolation lands in a single layer, so the implied
+    top-layer heating rate scales as 1/`ocean_surface_thickness` -- which is
+    why thinning the surface layer below ~30 m used to blow the coupled model
+    up within a couple of days. With penetration on, roughly the top
+    `shortwave_efold2` metres share the flux regardless of how the grid is
+    cut, so the surface layer can be made thin without the heating rate
+    running away with it.
     """
 
     grid_folder = Path(grid_folder)
@@ -262,16 +330,56 @@ def build_model(
         dt_tracer=veros_dt_tracer,
         # 30-layer geometric-stretch grid, same 5200 m total depth as the
         # previous hand-tuned 15-layer profile. `ocean_surface_thickness`
-        # (default 50 m, matching the old profile) is exposed as its own
-        # parameter -- a 10 m surface layer (5x smaller heat capacity for
-        # the same heat flux) triggered an immediate atm humidity
-        # explosion (~day 2) regardless of ocean timestep (tested
-        # 3600/1800/900s, all failed identically), so this is being swept
-        # to find how thin the surface layer can go before that happens.
+        # is exposed as its own parameter -- a 10 m surface layer (5x
+        # smaller heat capacity for the same heat flux) used to trigger an
+        # immediate atm humidity explosion (~day 2) regardless of ocean
+        # timestep (tested 3600/1800/900s, all failed identically). The
+        # suspected cause was that the *entire* absorbed solar flux was
+        # being dumped into that one top layer, making the daytime heating
+        # rate scale as 1/`ocean_surface_thickness`; see
+        # `enable_shortwave_penetration` and
+        # `_shortwave_penetration_divergence`, which spread it over the
+        # top ~`shortwave_efold2` metres instead.
         ddz=_geometric_stretched_ddz(n_layers=30, surface_thickness=ocean_surface_thickness, total_depth=5200.0)[:number_of_ocean_layers],
     )()
     ocn_model.setup()
     Veros.make_jem_compatible(ocn_model, coupling_timestep=coupling_timestep)
+
+    # Solar penetration profile (see `_shortwave_penetration_divergence`).
+    # `zw`/`dzt` are fixed by the grid, so this is a plain (nz,) constant
+    # computed once here and closed over by `interaction` below. Disabled ->
+    # all-zeros, i.e. the old behaviour where the whole shortwave flux is
+    # absorbed in the top layer via the net surface heat flux alone.
+    if enable_shortwave_penetration:
+        divpen_shortwave = _shortwave_penetration_divergence(
+            ocn_model.state.variables.zw,
+            ocn_model.state.variables.dzt,
+            rpart_shortwave=shortwave_rpart,
+            efold1_shortwave=shortwave_efold1,
+            efold2_shortwave=shortwave_efold2,
+        )
+        print(
+            "Shortwave penetration enabled: "
+            f"rpart={shortwave_rpart:g}, efold1={shortwave_efold1:g} m, "
+            f"efold2={shortwave_efold2:g} m"
+        )
+        print(f"  divpen_shortwave (surface -> bottom) = {np.asarray(divpen_shortwave)[::-1]}")
+    else:
+        divpen_shortwave = jnp.zeros_like(jnp.asarray(ocn_model.state.variables.dzt))
+        print("Shortwave penetration disabled: all solar absorbed in the top ocean layer.")
+
+    # Reference heat capacity / density used to turn W/m^2 into K m/s -- the
+    # same pair `jem/components/veros_component.py` uses for
+    # `forc_temp_surface`, pulled out of the traced `interaction` below.
+    ocn_cp_0 = 3991.86795711963
+    ocn_rho_0 = float(ocn_model.state.settings.rho_0)
+
+    if not ocn_model.state.settings.enable_tempsalt_sources:
+        raise RuntimeError(
+            "Veros setting `enable_tempsalt_sources` must be True for the "
+            "penetrating-shortwave `temp_source` term to be allocated and "
+            "applied (see veros_case_setup.py)."
+        )
     
     # Create Slab Ocean model, standing in for a land model -- on the same
     # rotated ocean grid as "ocn"/"exchange"/"lnd" (not JCM's own atm
@@ -384,6 +492,48 @@ def build_model(
         heat_flux = heat_flux * ice_free
         freshwater_flux = freshwater_flux * ice_free
         # ===== simple "swamp" sea ice mask end =====
+
+        # ===== penetrating shortwave radiation begin =====
+        # JCM's sea-surface net heat flux is
+        #   hfluxn[:, :, 1] = rsds*(1 - alb_s) + rlds - (rlus + shf + alhc*evap)
+        # (jcm/physics/surface/speedy_surface_flux.py), and `total_heat_flux`
+        # above is exactly -hfluxn[:, :, 1] (JCM's `hfluxn` only has a land
+        # and a sea component, so the `[:, :, 2]` index used by
+        # `jem/components/jcm_component.py` clamps to the sea one). So the
+        # absorbed solar part of the flux the ocean is already receiving is
+        # `rsds * (1 - alb_s)`, downward-positive, recomputed here from the
+        # same two diagnostics JCM itself used.
+        #
+        # `_shortwave_penetration_divergence` is a *redistribution* profile
+        # (it integrates to zero over the column), so `heat_flux` is left
+        # exactly as it is: the top layer still receives the full solar flux
+        # through `forc_temp_surface`, and `temp_source` then moves the
+        # penetrating fraction out of it and down into the layers below.
+        # Mirrors `set_forcing_kernel` in
+        # `veros/setups/global_1deg/global_1deg.py`.
+        solar_flux = dm.transform_scalar(
+            "atm", "exchange", "conserve",
+            atm["derived"].physics["_shortwave_rad"].rsds
+            * (1.0 - atm["derived"].physics["_mod_radcon"].alb_s),
+        )
+        # Sea ice cut `heat_flux` off above, which means the solar flux never
+        # entered the ocean at all there -- so there is nothing to
+        # redistribute either. Same masking as global_1deg's `ice[..., None]`.
+        solar_flux = solar_flux * ice_free
+
+        # W/m^2 * 1/m / (J/kg/K) / (kg/m^3) = K/s. `tempsalt_sources`
+        # multiplies by `maskT` itself, so no mask is needed here.
+        vs_ocn_forcing = ocn["state"].variables
+        with vs_ocn_forcing.unlock():
+            vs_ocn_forcing.temp_source = update(
+                vs_ocn_forcing.temp_source,
+                at[2:-2, 2:-2, :],
+                solar_flux[:, :, None]
+                * divpen_shortwave[None, None, :]
+                / ocn_cp_0
+                / ocn_rho_0,
+            )
+        # ===== penetrating shortwave radiation end =====
 
         # Mapping
         ocn["forcing"].surface_taux = surface_taux
