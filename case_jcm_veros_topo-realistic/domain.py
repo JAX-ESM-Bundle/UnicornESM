@@ -16,8 +16,6 @@ import xarray as xr
 def get_domain_master(
     grid_dir,
     truncation_number:int = 31,
-    ocean_resolution:float = 1.5,
-    mask_threshold:float = 0.3
 ):
     
     grid_dir = Path(grid_dir)
@@ -25,13 +23,20 @@ def get_domain_master(
     atm_grid = StructuredQuadMesh.from_SCRIP_file(grid_dir / f"JCM_T{truncation_number:d}.SCRIP.nc")
     sfc_grid = StructuredQuadMesh.from_SCRIP_file(grid_dir / "RotatedGaussianLatLon.SCRIP.nc")
 
-    sfc_lat = np.asarray(sfc_grid.face_lat)
-    sfc_lon = np.asarray(sfc_grid.face_lon)
-    sfc_land_fraction = jnp.asarray(xr.open_dataset(grid_dir / "landsea_mask_fraction_RotatedGaussianLatLon.nc")["lsm"].isel(valid_time=0).to_numpy())
+    # Topography files written by EarthSystemGrids' preprocessing_workflow
+    # (04_clean_surface.py / 05_regrid_to_atm.py), all (nj, ni) = (lat, lon).
+    # The surface `landsea_mask` (1 = land) is that workflow's cleaned mask
+    # (isolated ocean bodies filled), so it is used as is rather than
+    # re-thresholding `land_fraction` here: the "ocn"/"lnd" domain split,
+    # Veros' kbot (veros_case_setup.GridInfo) and fakelnd's active cells all
+    # read this one field and therefore cannot disagree about the coastline.
+    sfc_topo_ds = xr.open_dataset(grid_dir / "sfc_topo_RotatedGaussianLatLon.nc")
+    sfc_land_fraction = jnp.asarray(sfc_topo_ds["land_fraction"].to_numpy())
+    sfc_is_land = jnp.asarray(sfc_topo_ds["landsea_mask"].to_numpy() == 1)
 
-    atm_landsea_ds = xr.open_dataset(grid_dir / f"landsea_mask_fraction_JCM_T{truncation_number:d}.nc")
-    atm_land_fraction = jnp.asarray(atm_landsea_ds["lsm"].isel(valid_time=0).to_numpy())
-    atm_topography = jnp.asarray(atm_landsea_ds["topography"].isel(valid_time=0).to_numpy())
+    atm_topo_ds = xr.open_dataset(grid_dir / f"atm_topo_JCM_T{truncation_number:d}.nc")
+    atm_land_fraction = jnp.asarray(atm_topo_ds["land_fraction"].to_numpy())
+    atm_topography = jnp.asarray(atm_topo_ds["topography"].to_numpy())
 
     dm = DomainMaster()
     dm.register_domain(
@@ -54,14 +59,14 @@ def get_domain_master(
         name = "ocn",
         grid = sfc_grid,
         land_fraction = sfc_land_fraction,
-        mask = sfc_land_fraction < mask_threshold,
+        mask = ~sfc_is_land,
     )
 
     dm.register_domain(
         name = "lnd",
         grid = sfc_grid,
         land_fraction = sfc_land_fraction,
-        mask = sfc_land_fraction >= mask_threshold,
+        mask = sfc_is_land,
     )
 
     dm.register_transformation(source="atm", target="exchange", method="bilinear", weight_file=grid_dir / f"weight_algo-bilinear_JCM_T{truncation_number:d}_to_RotatedGaussianLatLon.nc")

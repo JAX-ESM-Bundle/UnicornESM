@@ -35,12 +35,10 @@ class GridInfo:
 
     scrip_grid_file: str
     landsea_mask_file: str
-    landsea_mask_threshold: float    
     info: dict
 
-    def __init__(self, scrip_grid_file:str, landsea_mask_file: str, landsea_mask_threshold: float):
+    def __init__(self, scrip_grid_file:str, landsea_mask_file: str):
         self.scrip_grid_file = scrip_grid_file
-        self.landsea_mask_threshold = landsea_mask_threshold
         self.landsea_mask_file = landsea_mask_file
         self.get_grid_info()
 
@@ -124,10 +122,12 @@ class GridInfo:
         # TODO: real bathymetry is still needed here -- this only gives a
         # binary land/sea mask, so every ocean column gets the same flat
         # bottom depth (kbot) rather than actual varying ocean depth.
-        # ERA5-derived fractional land-sea mask on the same SCRIP grid; convention: 1 = land.
+        # Cleaned binary land-sea mask on the same SCRIP grid (the
+        # `sfc_topo_*.nc` file of EarthSystemGrids' preprocessing_workflow);
+        # convention: 1 = land. Used as is, so Veros agrees cell for cell
+        # with the "ocn"/"lnd" domain split in domain.get_domain_master.
         mask_ds = xr.open_dataset(self.landsea_mask_file)
-        lsm = mask_ds["lsm"].to_numpy().reshape(ny, nx)
-        is_land = lsm >= self.landsea_mask_threshold
+        is_land = mask_ds["landsea_mask"].to_numpy().reshape(ny, nx) == 1
         landsea_mask = (1 - is_land.astype(int)).transpose()  # -> ocean=1/land=0, (xt, yt); Veros kbot wants 0 = land
 
         self.nx = nx
@@ -143,18 +143,15 @@ class GridInfo:
 def generateVerosSetup(
     scrip_grid_file: str,
     landsea_mask_file: str,
-    landsea_mask_threshold: float = 0.5,
     ddz: Sequence[float] = [50.0, 70.0, 100.0, 140.0, 190.0, 240.0, 290.0, 340.0, 390.0, 440.0, 490.0, 540.0, 590.0, 640.0, 690.0],
     dt_mom: float = 1800.0,
     dt_tracer: float = 1800.0,
     cold_start_ocean_temperature_reference_K: float = 10.0,
 ):
 
-    print(f"landsea_mask_threshold = {landsea_mask_threshold:f}")
     grid_info = GridInfo(
         scrip_grid_file = scrip_grid_file,
         landsea_mask_file = landsea_mask_file,
-        landsea_mask_threshold = landsea_mask_threshold,
     )
 
     ddz = npx.array(ddz)

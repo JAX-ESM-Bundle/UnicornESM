@@ -31,20 +31,19 @@ export PYTHONHASHSEED=0
 
 echo "PYTHONPATH=$PYTHONPATH"
 
-JOB_ID=${SLURM_JOBID:-NO_JOB_ID}
-    
-grid_folder=grid_res-3deg
+# Symlink to the grid/topography/weight files produced by EarthSystemGrids'
+# preprocessing_workflow.
+grid_folder=grid
 
+# Resubmitting this same script resumes the run from its checkpoint
+# (output_T31/<simulation-name>/checkpoint).
 time python3 main_forward.py \
-    --total-simulation-days $(( 365 * 1000 ))       \
-    --simulation-interval-days 73                   \
+    --total-simulation-days $(( 365 * 1 ))          \
+    --simulation-interval-days 365                  \
     --checkpoint-interval $(( 5 * 5 ))              \
     --truncation-number 31                          \
     --simulation-name real_topo                     \
     --jcm-timestep-min 30                           \
     --veros-timestep-min 60                         \
-    --max-rerun-attempts 0                          \
     --grid-folder $grid_folder                      \
-    --ocean-surface-thickness 30                    \
-    --explode-log explode.${JOB_ID}.log
-
+    --ocean-surface-thickness 30
