@@ -209,7 +209,6 @@ def build_model(
     shortwave_rpart: float = 0.58,
     shortwave_efold1: float = 0.35,
     shortwave_efold2: float = 23.0,
-    landsea_threshold: float = 0.25,
 ):
     """Build the coupled JCM + Veros + SlabLand system.
 
@@ -262,8 +261,6 @@ def build_model(
     lon_deg = coords.horizontal.longitudes * 180 / jnp.pi
     lat_deg = coords.horizontal.latitudes * 180 / jnp.pi
 
-    terrain.fmask = jnp.where(terrain.fmask <= landsea_threshold, 0.0, jnp.where(terrain.fmask >= landsea_threshold, 1.0, terrain.fmask))
-    
     # Create JCM
     raw_atm_model = jcm.model.Model(
         coords=coords,
