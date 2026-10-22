@@ -494,7 +494,7 @@ def build_model(
             freshwater_flux=atm["derived"].total_freshwater_flux,
         ))
  
-        updated_components = dict(components, atm=atm, ocn=ocn, lnd=lnd)
+        updated_components = dict(components, atm=atm, ocn=ocn, lnd=lnd, seaice=seaice)
 
 
         if debug_mode:
