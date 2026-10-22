@@ -33,11 +33,13 @@ import xarray as xr
 
 class GridInfo:
 
+    rotated_grid: bool
     scrip_grid_file: str
     landsea_mask_file: str
     info: dict
 
-    def __init__(self, scrip_grid_file:str, landsea_mask_file: str):
+    def __init__(self, rotated_grid:bool, scrip_grid_file:str, landsea_mask_file: str):
+        self.rotated_grid = rotated_grid
         self.scrip_grid_file = scrip_grid_file
         self.landsea_mask_file = landsea_mask_file
         self.get_grid_info()
@@ -61,8 +63,17 @@ class GridInfo:
         nlon, nlat = grid_ds["grid_dims"].to_numpy()
         nx, ny = int(nlon), int(nlat)
 
-        native_lat = grid_ds["native_lat"].to_numpy()  # (ny,) centres, non-uniform (Gaussian)
-        native_lon = grid_ds["native_lon"].to_numpy()  # (nx,) centres, uniform
+        if self.rotated_grid:
+            native_lat = grid_ds["native_lat"].to_numpy()  # (ny,) centres, non-uniform (Gaussian)
+            native_lon = grid_ds["native_lon"].to_numpy()  # (nx,) centres, uniform
+        else:
+            native_lat = grid_ds["grid_center_lat"].to_numpy().reshape((nx, ny), order="F")[0, :]
+            native_lon = grid_ds["grid_center_lon"].to_numpy().reshape((nx, ny), order="F")[:, 0]
+
+            print("Non-rotating: ")
+            print("native_lat: ", native_lat)
+            print("native_lon: ", native_lon)
+
 
         # Veros reconstructs cell-centre vs.yt/vs.xt from vs.dyt/vs.dxt via a
         # leapfrog-style recursion (veros.core.numerics.u_centered_grid) that is
@@ -141,6 +152,7 @@ class GridInfo:
 
 
 def generateVerosSetup(
+    rotated_grid: bool,
     scrip_grid_file: str,
     landsea_mask_file: str,
     ddz: Sequence[float] = [50.0, 70.0, 100.0, 140.0, 190.0, 240.0, 290.0, 340.0, 390.0, 440.0, 490.0, 540.0, 590.0, 640.0, 690.0],
@@ -150,6 +162,7 @@ def generateVerosSetup(
 ):
 
     grid_info = GridInfo(
+        rotated_grid = rotated_grid,
         scrip_grid_file = scrip_grid_file,
         landsea_mask_file = landsea_mask_file,
     )

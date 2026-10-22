@@ -15,19 +15,24 @@ import jcm
 from jcm.physics.speedy.speedy_coords import get_speedy_coords
 from jcm.terrain import TerrainData
 
+import xarray as xr
+
 from jem import Coupler
 # Importing `VerosComponent` is what points Veros at the JAX backend (and
 # turns on x64) -- it has to come before anything that imports
 # `veros.core.operators`, which binds its array backend at import time.
-from jem.components import JCMComponent, SlabGrid, VerosComponent
+from jem.components import (
+    SlabGrid,
+    SlabLandModel,
+    SlabLandParameters,
+    SlabSeaiceModel,
+    JCMComponent,
+    VerosComponent,
+)
 from jem.components.veros_component import GHOST_CELLS, SEAWATER_HEAT_CAPACITY
-
 from veros_case_setup import generateVerosSetup
-
 from veros.core.operators import update, at
-
 from domain import get_domain_master
-from fake_land import FakeLandModel
 
 def is_pytree_all_finite(tree):
     return jax.tree_util.tree_reduce(
@@ -72,7 +77,7 @@ def report_first_nonfinite(name, x, lon=None, lat=None):
 
 
 
-def _freeze_season(atm_model, freeze_season_at_day):
+def _freeze_season(raw_atm_model, freeze_season_at_day):
     """Pin `atm_model`'s seasonal (day-of-year) forcing to a fixed day, while
     leaving the diurnal (time-of-day) cycle running.
 
@@ -109,7 +114,7 @@ def _geometric_stretched_ddz(n_layers: int, surface_thickness: float, total_dept
     (thermocline/mixed layer, where gradients and diurnal forcing are
     sharpest) and coarsens smoothly with depth, with no explicit
     bathymetry-dependent cap -- appropriate here since this setup's
-    GridInfo still uses a flat-bottom ocean (uniform total_depth
+    GridInfo still uses a flat-bottom  (uniform total_depth
     everywhere; see GridInfo's own TODO about real bathymetry in
     veros_case_setup.py).
 
@@ -147,13 +152,13 @@ def _shortwave_penetration_divergence(
 
     Ported verbatim from `veros/setups/global_1deg/global_1deg.py`
     (`set_initial_conditions`). Solar radiation is not absorbed entirely in
-    the ocean's top layer: it decays with depth as a two-band exponential
+    the 's top layer: it decays with depth as a two-band exponential
     (Paulson & Simpson 1977 / the SPEEDY-era "Jerlov water type I" fit),
 
         pen(z) = rpart * exp(z / efold1) + (1 - rpart) * exp(z / efold2)
 
     with `z <= 0` (Veros' `zw` is the *upper* interface of each T-cell, so
-    `zw[-1] == 0` is the surface and `zw[0]` the ocean floor). `rpart` is
+    `zw[-1] == 0` is the surface and `zw[0]` the  floor). `rpart` is
     the red/near-IR fraction, killed off within `efold1` (0.35 m) of the
     surface; the remainder is the blue-green band, reaching `efold2` (23 m).
 
@@ -169,7 +174,7 @@ def _shortwave_penetration_divergence(
     Below the sea floor the deposited heat is dropped rather than
     redistributed, since `tempsalt_sources` multiplies `temp_source` by
     `maskT` -- the same behaviour as global_1deg. Harmless for this setup's
-    flat-bottom (5200 m) ocean, where `pen` is ~1e-10 at the deepest
+    flat-bottom (5200 m) , where `pen` is ~1e-10 at the deepest
     interface anyway.
     """
     zw = jnp.asarray(zw)
@@ -204,8 +209,9 @@ def build_model(
     shortwave_rpart: float = 0.58,
     shortwave_efold1: float = 0.35,
     shortwave_efold2: float = 23.0,
+    landsea_threshold: float = 0.25,
 ):
-    """Build the coupled JCM + Veros + fake-land system.
+    """Build the coupled JCM + Veros + SlabLand system.
 
     Returns the assembled `Coupler` (which owns the workflow and the clock)
     together with a `config` dict of supporting objects, so that callers can
@@ -218,12 +224,12 @@ def build_model(
     itself. The diurnal cycle keeps advancing normally. See `_freeze_season`.
 
     `enable_shortwave_penetration`: let the absorbed solar flux be deposited
-    over a finite depth range instead of entirely in the ocean's top layer,
+    over a finite depth range instead of entirely in the 's top layer,
     using the two-band exponential profile of
     `_shortwave_penetration_divergence` (`shortwave_rpart` /
     `shortwave_efold1` / `shortwave_efold2` are its parameters). Without it,
     100% of the daytime insolation lands in a single layer, so the implied
-    top-layer heating rate scales as 1/`ocean_surface_thickness` -- which is
+    top-layer heating rate scales as 1/`_surface_thickness` -- which is
     why thinning the surface layer below ~30 m used to blow the coupled model
     up within a couple of days. With penetration on, roughly the top
     `shortwave_efold2` metres share the flux regardless of how the grid is
@@ -234,75 +240,93 @@ def build_model(
     grid_folder = Path(grid_folder)
     print(f"grid_folder = {str(grid_folder):s}")
 
-    dm = get_domain_master(
-        grid_folder,
-        truncation_number = truncation_number,
-    )
     coords = get_speedy_coords(spectral_truncation=truncation_number)
 
     # Real topography, on JCM's own native (unrotated) grid -- not the
-    # rotated ocean grid's mask file. JCM's Coriolis parameter is
+    # rotated  grid's mask file. JCM's Coriolis parameter is
     # `2*omega*sin(lat)` computed directly from its own native latitude
     # (dinosaur.primitive_equations.PrimitiveEquations.coriolis_parameter,
     # hard-coded, no override hook), so terrain must be geographically
-    # consistent with *that* latitude, not the ocean's rotated one. The
+    # consistent with *that* latitude, not the 's rotated one. The
     # grid folder ships this file already in JCM's canonical layout (dims
     # (lon, lat), vars lsm/orog); it holds the same land fraction and
     # topography as the "atm" domain of `dm`.
-    terrain = TerrainData.from_file(
-        grid_folder / f"terrain_JCM_T{truncation_number:d}.nc", coords=coords,
+
+    ds_terrain = xr.load_dataset(grid_folder / f"topo_JCM_T{truncation_number:d}.nc")
+    terrain = TerrainData.from_coords(
+        coords=coords,
+        # The file is (nj, ni) = (lat, lon); JCM wants (lon, lat).
+        orography=jnp.asarray(ds_terrain["topography"].transpose("ni", "nj").values),
+        fmask=jnp.asarray(ds_terrain["land_fraction"].transpose("ni", "nj").values),
     )
+    lon_deg = coords.horizontal.longitudes * 180 / jnp.pi
+    lat_deg = coords.horizontal.latitudes * 180 / jnp.pi
+
+    terrain.fmask = jnp.where(terrain.fmask <= landsea_threshold, 0.0, jnp.where(terrain.fmask >= landsea_threshold, 1.0, terrain.fmask))
     
     # Create JCM
-    atm_model = jcm.model.Model(
+    raw_atm_model = jcm.model.Model(
         coords=coords,
         start_time=start_datetime,
         terrain=terrain,
         time_step=jcm_dt/60.0,
     )
     if freeze_season_at_day is not None:
-        _freeze_season(atm_model, freeze_season_at_day)
-    # The two boundary conditions the `interaction` exchanger below writes
-    # every coupling step. Declaring them makes the component hold each as a
-    # plain per-step (lon, lat) array in its carry, so the carry's pytree
-    # structure is the same before and after the exchanger has written.
-    atm_component = JCMComponent(
-        atm_model,
-        exchanged_forcing=["sea_surface_temperature", "stl_am"],
+        _freeze_season(raw_atm_model, freeze_season_at_day)
+    
+    atm_component = JCMComponent(raw_atm_model)
+    atm_D2_nodal_shape = raw_atm_model.coords.nodal_shape[1:]
+    
+    lon_deg = raw_atm_model.coords.horizontal.longitudes * 180 / jnp.pi
+    lat_deg = raw_atm_model.coords.horizontal.latitudes * 180 / jnp.pi
+
+    slab_grid = SlabGrid.from_coords(
+        raw_atm_model.coords.horizontal,
+        raw_atm_model.terrain.fmask,
     )
-    atm_D2_nodal_shape = atm_model.coords.nodal_shape[1:]
-    
-    # Longitude/latitude (in degrees) of the atmosphere's nodal grid, used by
-    # `report_first_nonfinite` in `interaction` to locate non-finite values.
-    lon_deg = atm_model.coords.horizontal.longitudes * 180 / jnp.pi
-    lat_deg = atm_model.coords.horizontal.latitudes * 180 / jnp.pi
-    
+
+    # Seaice Model
+    seaice_component = SlabSeaiceModel(slab_grid)
+ 
+    # Land Model
+    lnd_component = SlabLandModel(
+        slab_grid,
+        SlabLandParameters(
+            temperature_relaxation_timescale=86400.0 * 10,
+            drainage_timescale=jnp.asarray([86400.0 * 180.0,]),
+        ),
+        land_surface_temperature_from_clim_file = False,
+        snow_depth_from_clim_file = False,
+    )
+
     # Create Veros
     # First need to remove `output_veros.*.nc` files, otherwise veros complains.
     for f in glob.glob("output_veros.*.nc"):
         print(f"Deleting: {f}")
         os.remove(f)
-    
+   
+    ocean_grid = "JCM_T31"#RotatedGaussianLatLon" 
     # `generateVerosSetup` needs raw file access (native_lat/native_lon axis
     # metadata that isn't part of a `Domain`'s in-memory land_fraction/mask
-    # arrays), so it's handed the ocean grid/mask files directly rather than
+    # arrays), so it's handed the  grid/mask files directly rather than
     # going through `dm` -- these are the same files `dm` itself loaded the
     # "ocn"/"exchange" domains' grid and land-sea mask from, in
     # `get_domain_master`.
     ocn_model = generateVerosSetup(
-        scrip_grid_file = grid_folder / "RotatedGaussianLatLon.SCRIP.nc",
-        landsea_mask_file = grid_folder / "sfc_topo_RotatedGaussianLatLon.nc",
+        rotated_grid=False,
+        scrip_grid_file = grid_folder / f"{ocean_grid:s}.SCRIP.nc",
+        landsea_mask_file = grid_folder / f"topo_{ocean_grid:s}.nc",
         dt_mom=veros_dt_mom,
         dt_tracer=veros_dt_tracer,
         # 30-layer geometric-stretch grid, same 5200 m total depth as the
-        # previous hand-tuned 15-layer profile. `ocean_surface_thickness`
+        # previous hand-tuned 15-layer profile. `_surface_thickness`
         # is exposed as its own parameter -- a 10 m surface layer (5x
         # smaller heat capacity for the same heat flux) used to trigger an
-        # immediate atm humidity explosion (~day 2) regardless of ocean
+        # immediate atm humidity explosion (~day 2) regardless of 
         # timestep (tested 3600/1800/900s, all failed identically). The
         # suspected cause was that the *entire* absorbed solar flux was
         # being dumped into that one top layer, making the daytime heating
-        # rate scale as 1/`ocean_surface_thickness`; see
+        # rate scale as 1/`_surface_thickness`; see
         # `enable_shortwave_penetration` and
         # `_shortwave_penetration_divergence`, which spread it over the
         # top ~`shortwave_efold2` metres instead.
@@ -332,7 +356,7 @@ def build_model(
         print(f"  divpen_shortwave (surface -> bottom) = {np.asarray(divpen_shortwave)[::-1]}")
     else:
         divpen_shortwave = jnp.zeros_like(jnp.asarray(ocn_model.state.variables.dzt))
-        print("Shortwave penetration disabled: all solar absorbed in the top ocean layer.")
+        print("Shortwave penetration disabled: all solar absorbed in the top  layer.")
 
     # Reference heat capacity / density used to turn W/m^2 into K m/s -- the
     # same pair `jem/components/veros_component.py` uses for
@@ -347,27 +371,6 @@ def build_model(
             "applied (see veros_case_setup.py)."
         )
     
-    # Create the fake land (see fake_land.py), standing in for a land model
-    # -- on the same rotated ocean grid as "ocn"/"exchange"/"lnd" (not JCM's
-    # own atm grid), so its forcing/state flow through dm's atm<->exchange
-    # transformations exactly like `ocn`'s do.
-    #
-    # It is a slab *ocean* model underneath, which only integrates the cells
-    # where `grid.binary_mask == 0` ("ocean" to it) and holds every other
-    # cell at a constant 288.15 K. We want it to integrate the true *land*
-    # cells, so the mask it is given is the "ocn" domain's: 1 over true
-    # ocean (ignored there, since Veros owns that domain), 0 over true land
-    # (active). `dm`'s masks are (nface,) or (lat, lon) row-major over the
-    # mesh's (lat, lon) shape, rather than JEM's (lon, lat) -- reshape and
-    # transpose before handing it to SlabGrid.
-    lnd_grid_shape = dm.domains["lnd"].grid.shape  # (nj, ni) = (lat, lon)
-    fakelnd_inactive = jnp.asarray(dm.domains["ocn"].mask).reshape(lnd_grid_shape).T  # (lat, lon) -> (lon, lat)
-    fakelnd_grid = SlabGrid.from_scrip(
-        str(grid_folder / "RotatedGaussianLatLon.SCRIP.nc"),
-        fractional_mask=fakelnd_inactive.astype(float),
-        threshold=0.5,
-    )
-    fakelnd_component = FakeLandModel(grid=fakelnd_grid, name="fakelnd")
 
     # Creating Flux and Scalar Exchange between Components
     #
@@ -375,7 +378,6 @@ def build_model(
     # the `BasicMapper` that JEM provides. You can define your own mapping
     # function. In this example, we simply define a function `interaction`
     # as below.
-
 
     # An exchanger takes every component's carry plus the coupler's clock
     # and returns the carries to use for this coupled step. Carries are
@@ -388,7 +390,8 @@ def build_model(
         del time  # this coupling does not depend on the date
         atm = components["atm"]
         ocn = components["ocn"]
-        fakelnd = components["fakelnd"]
+        lnd = components["lnd"]
+        seaice = components["seaice"]
 
         # ===== compute wind stress begin =====
         # Tien-Yiao's ad-hoc way to compute wind stress.
@@ -399,10 +402,9 @@ def build_model(
         # `dm.transform_vector` rotates (u0, v0) from JCM's own grid-local
         # frame to geographic east/north (a no-op here, since JCM's grid is
         # unrotated), regrids each geographic component atm -> exchange,
-        # then rotates into the ocean grid's local (rotated) frame using
+        # then rotates into the  grid's local (rotated) frame using
         # its per-cell cos_angle/sin_angle.
-        wind_x, wind_y = dm.transform_vector(
-            "atm", "exchange", "conserve",
+        wind_x, wind_y = (
             atm["derived"].u0,
             atm["derived"].v0,
         )
@@ -420,23 +422,8 @@ def build_model(
         surface_tauy = drag_coefficient * air_density * wind_velocity * wind_y
         # ===== compute wind stress end =====
 
-        heat_flux = dm.transform_scalar("atm", "exchange", "conserve", atm["derived"].total_heat_flux)
-        freshwater_flux = dm.transform_scalar("atm", "exchange", "conserve", atm["derived"].total_freshwater_flux)
-
-        # ===== simple "swamp" sea ice mask begin =====
-        # Ported from `veros/setups/global_1deg/global_1deg.py`: once the
-        # ocean surface reaches the freezing point, sea ice insulates it
-        # from further heat/freshwater exchange with the atmosphere. Flux
-        # that would warm the ocean (melt) is always let through. `heat_flux`
-        # is upward-positive (see `jem.components.Veros`), so a flux that
-        # warms the ocean is negative.
-        freezing_point_K = 273.15 - 1.8
-        not_frozen = ocn["derived"].sea_surface_temperature > freezing_point_K
-        would_warm = heat_flux < 0
-        ice_free = jnp.logical_or(not_frozen, would_warm)
-        heat_flux = heat_flux * ice_free
-        freshwater_flux = freshwater_flux * ice_free
-        # ===== simple "swamp" sea ice mask end =====
+        ocean_heat_flux = atm["derived"].total_heat_flux
+        freshwater_flux = atm["derived"].total_freshwater_flux
 
         # ===== penetrating shortwave radiation begin =====
         # JCM's sea-surface net heat flux is
@@ -444,7 +431,7 @@ def build_model(
         # (jcm/physics/surface/speedy_surface_flux.py), which is what
         # `total_heat_flux` above carries (negated, and blended with the
         # land tile's by JCM's own `fmask` in coastal cells). So the absorbed
-        # solar part of the flux the ocean is already receiving is
+        # solar part of the flux the  is already receiving is
         # `rsds * (1 - alb_s)`, downward-positive, recomputed here from the
         # same two diagnostics JCM itself used.
         #
@@ -455,15 +442,7 @@ def build_model(
         # penetrating fraction out of it and down into the layers below.
         # Mirrors `set_forcing_kernel` in
         # `veros/setups/global_1deg/global_1deg.py`.
-        solar_flux = dm.transform_scalar(
-            "atm", "exchange", "conserve",
-            atm["derived"].physics["_shortwave_rad"].rsds
-            * (1.0 - atm["derived"].physics["_mod_radcon"].alb_s),
-        )
-        # Sea ice cut `heat_flux` off above, which means the solar flux never
-        # entered the ocean at all there -- so there is nothing to
-        # redistribute either. Same masking as global_1deg's `ice[..., None]`.
-        solar_flux = solar_flux * ice_free
+        solar_flux = atm["derived"].physics["_shortwave_rad"].rsds * (1.0 - atm["derived"].physics["_mod_radcon"].alb_s)
 
         # W/m^2 * 1/m / (J/kg/K) / (kg/m^3) = K/s. `tempsalt_sources`
         # multiplies by `maskT` itself, so no mask is needed here.
@@ -479,69 +458,50 @@ def build_model(
                 / ocn_rho_0,
             )
         # ===== penetrating shortwave radiation end =====
+            
+        sea_surface_temperature = ocn["derived"].sea_surface_temperature
 
-        fakelnd_temperature = jnp.clip(
-            fakelnd["state"].sea_surface_temperature,
-            200.0, #273.15 - 50.0,
-            273.15 + 30.0,
-        )
-
-        # JCM does its own land/sea blend internally, using its own
-        # continuous fmask at its native resolution:
-        #   tsfc = sea_surface_temperature + fmask*(stl_am - sea_surface_temperature)
-        # (jcm/physics/surface/speedy_surface_flux.py). It needs
-        # `sea_surface_temperature`/`stl_am` as two separate, unblended
-        # fields to do that blend correctly -- pre-merging them into one
-        # composite here (as an earlier version of this code did) makes
-        # them identical, which silently zeroes out JCM's own fmask term
-        # (fmask*(x-x) = 0) and replaces its fine-resolution blend with
-        # whatever crude blending happened during our own coarser
-        # exchange-grid compositing instead. So each is regridded
-        # separately here, straight off "exchange" (the same grid `ocn`/
-        # `fakelnd` are already on, so no domain-specific masking is
-        # needed -- masking either to zero here, rather than letting
-        # JCM's own fmask blend handle the coastline, would inject a
-        # literal 0 Kelvin discontinuity at every coastal cell).
-        atm_sea_surface_temperature = jnp.clip(
-            dm.transform_scalar("exchange", "atm", "bilinear", ocn["derived"].sea_surface_temperature),
+        atmgrid_sea_surface_temperature = jnp.clip(
+            sea_surface_temperature,
             250.0,
             310.0, 
         )
-        atm_stl_am = dm.transform_scalar("exchange", "atm", "bilinear", fakelnd_temperature)
+        atmgrid_stl_am = lnd["state"].land_surface_temperature
+        
 
-        # Mapping
-        def like(value, destination):
-            return jnp.asarray(value).astype(destination.dtype)
+        # Exchange information
+        atm = dict(atm, forcing=atm["forcing"].replace(
+            sea_surface_temperature = atmgrid_sea_surface_temperature,
+            sice_am=seaice["state"].ice_fraction,
+            stl_am=atmgrid_stl_am,
+            snowc_am=lnd["state"].snow_cover,
+            soilw_am=lnd["state"].soil_water_content[:, :, 0],
+        ))
+
+        seaice = dict(seaice, forcing=seaice["forcing"].replace(
+            sea_surface_temperature=sea_surface_temperature,
+        ))
+
+        lnd = dict(lnd, forcing=lnd["forcing"].replace(
+            total_heat_flux=atm["derived"].total_heat_flux,
+            precipitation=atm["derived"].precipitation,
+        ))
 
         ocn = dict(ocn, forcing=ocn["forcing"].replace(
-            surface_taux=like(surface_taux, ocn["forcing"].surface_taux),
-            surface_tauy=like(surface_tauy, ocn["forcing"].surface_tauy),
-            heat_flux=like(heat_flux, ocn["forcing"].heat_flux),
-            freshwater_flux=like(freshwater_flux, ocn["forcing"].freshwater_flux),
+            surface_taux=surface_taux,
+            surface_tauy=surface_tauy,
+            heat_flux=atm["derived"].total_heat_flux,
+            freshwater_flux=atm["derived"].total_freshwater_flux,
         ))
-        fakelnd = dict(
-            fakelnd,
-            forcing=fakelnd["forcing"].replace(
-                total_heat_flux=like(heat_flux, fakelnd["forcing"].total_heat_flux),
-            ),
-            state=fakelnd["state"].replace(
-                sea_surface_temperature=like(
-                    fakelnd_temperature, fakelnd["state"].sea_surface_temperature),
-            ),
-        )
-        atm = dict(atm, forcing=atm["forcing"].replace(
-            sea_surface_temperature=like(
-                atm_sea_surface_temperature, atm["forcing"].sea_surface_temperature),
-            stl_am=like(atm_stl_am, atm["forcing"].stl_am),
-        ))
-        coupled_carry = dict(components, atm=atm, ocn=ocn, fakelnd=fakelnd)
+ 
+        updated_components = dict(components, atm=atm, ocn=ocn, lnd=lnd)
 
 
         if debug_mode:
 
             print("Notice: debug_mode is on.")
 
-            # Debug: report wind speed (atm), ocean velocity, and stratification (ocn) extremes
+            # Debug: report wind speed (atm),  velocity, and stratification (ocn) extremes
             vs_ocn = ocn["state"].variables
             jax.debug.print(
                 "max|wind_u| (atm) = {wu:.6e}, max|wind_v| (atm) = {wv:.6e}, "
@@ -564,9 +524,9 @@ def build_model(
                     report_first_nonfinite("wind_y", wind_y, lon_deg, lat_deg)
                     report_first_nonfinite("ocn.forcing.heat_flux", ocn["forcing"].heat_flux, lon_deg, lat_deg)
                     report_first_nonfinite("atm.forcing.stl_am", atm["forcing"].stl_am, lon_deg, lat_deg)
-                    # The crash was first seen in the ocean state (u, v, Nsqr
+                    # The crash was first seen in the  state (u, v, Nsqr
                     # all NaN while the atmosphere was still finite), so check
-                    # the ocean's prognostic fields too (3D: x, y, depth).
+                    # the 's prognostic fields too (3D: x, y, depth).
                     report_first_nonfinite("ocn.state.temp", vs_ocn.temp[..., vs_ocn.tau])
                     report_first_nonfinite("ocn.state.salt", vs_ocn.salt[..., vs_ocn.tau])
                     report_first_nonfinite("ocn.state.u", vs_ocn.u[..., vs_ocn.tau])
@@ -575,23 +535,25 @@ def build_model(
                     # jax.debug.breakpoint()  # disabled: no TTY in SLURM batch jobs -> JaxRuntimeError
                 jax.lax.cond(all_finite, true_fn, false_fn, x)
 
-            breakpoint_if_nonfinite(coupled_carry) 
+            breakpoint_if_nonfinite(updated_components) 
 
 
-        return coupled_carry
+        return updated_components
 
     # One coupled step: exchange first, then every component integrates the
     # same exchanged state over `coupling_timestep`.
     model = Coupler(
         components=dict(
             atm=atm_component,
+            seaice=seaice_component,
+            lnd=lnd_component,
             ocn=ocn_component,
-            fakelnd=fakelnd_component,
+
         ),
         exchangers=dict(mapper=interaction),
         coupling_timestep=coupling_timestep,
         start_date=start_datetime,
-        workflow=["mapper", "atm", "ocn", "fakelnd"],
+        workflow=["mapper", "atm", "ocn", "lnd", "seaice"],
     )
 
     config = dict(
